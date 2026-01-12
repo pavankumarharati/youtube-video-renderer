@@ -3,13 +3,21 @@ name: Render Video
 on:
   workflow_dispatch:
     inputs:
-      composition_id:
-        description: 'Composition ID for the video to render'
+      manifest:
+        description: 'Video composition manifest JSON'
         required: true
         type: string
-      callback_url:
-        description: 'Callback URL to notify when rendering is complete'
-        required: false
+      job_id:
+        description: 'Unique job ID for tracking'
+        required: true
+        type: string
+      supabase_url:
+        description: 'Supabase project URL'
+        required: true
+        type: string
+      supabase_key:
+        description: 'Supabase API key'
+        required: true
         type: string
 
 jobs:
@@ -29,21 +37,16 @@ jobs:
       
       - name: Render video
         env:
-          COMPOSITION_ID: ${{ github.event.inputs.composition_id }}
-          CALLBACK_URL: ${{ github.event.inputs.callback_url }}
+          MANIFEST: ${{ github.event.inputs.manifest }}
+          JOB_ID: ${{ github.event.inputs.job_id }}
+          SUPABASE_URL: ${{ github.event.inputs.supabase_url }}
+          SUPABASE_KEY: ${{ github.event.inputs.supabase_key }}
         run: npm run render
       
       - name: Upload rendered video
         if: always()
         uses: actions/upload-artifact@v3
         with:
-          name: rendered-video
+          name: rendered-video-${{ github.event.inputs.job_id }}
           path: output/
           retention-days: 30
-      
-      - name: Notify callback
-        if: ${{ github.event.inputs.callback_url != '' }}
-        run: |
-          curl -X POST ${{ github.event.inputs.callback_url }} \
-            -H "Content-Type: application/json" \
-            -d '{"status": "completed", "composition_id": "${{ github.event.inputs.composition_id }}", "job_id": "${{ github.run_id }}"}'
