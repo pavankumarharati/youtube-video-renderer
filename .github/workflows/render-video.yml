@@ -1,0 +1,49 @@
+name: Render Video
+
+on:
+  workflow_dispatch:
+    inputs:
+      composition_id:
+        description: 'Composition ID for the video to render'
+        required: true
+        type: string
+      callback_url:
+        description: 'Callback URL to notify when rendering is complete'
+        required: false
+        type: string
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+      
+      - name: Install dependencies
+        run: npm install
+      
+      - name: Render video
+        env:
+          COMPOSITION_ID: ${{ github.event.inputs.composition_id }}
+          CALLBACK_URL: ${{ github.event.inputs.callback_url }}
+        run: npm run render
+      
+      - name: Upload rendered video
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: rendered-video
+          path: output/
+          retention-days: 30
+      
+      - name: Notify callback
+        if: ${{ github.event.inputs.callback_url != '' }}
+        run: |
+          curl -X POST ${{ github.event.inputs.callback_url }} \
+            -H "Content-Type: application/json" \
+            -d '{"status": "completed", "composition_id": "${{ github.event.inputs.composition_id }}", "job_id": "${{ github.run_id }}"}'
