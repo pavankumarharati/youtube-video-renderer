@@ -4,49 +4,155 @@ on:
   workflow_dispatch:
     inputs:
       manifest:
-        description: 'Video composition manifest JSON'
+        description: 'JSON render manifest'
         required: true
-        type: string
       job_id:
-        description: 'Unique job ID for tracking'
+        description: 'Job ID for callback'
         required: true
-        type: string
       supabase_url:
         description: 'Supabase project URL'
         required: true
-        type: string
       supabase_key:
-        description: 'Supabase API key'
+        description: 'Supabase service role key'
         required: true
-        type: string
 
 jobs:
   render:
     runs-on: ubuntu-latest
-    
+    timeout-minutes: 60
+
     steps:
-      - uses: actions/checkout@v3
-      
-      - name: Setup Node.js
-        uses: actions/setup-node@v3
-        with:
-          node-version: '18'
-      
-      - name: Install dependencies
-        run: npm install
-      
-      - name: Render video
-        env:
-          MANIFEST: ${{ github.event.inputs.manifest }}
-          JOB_ID: ${{ github.event.inputs.job_id }}
-          SUPABASE_URL: ${{ github.event.inputs.supabase_url }}
-          SUPABASE_KEY: ${{ github.event.inputs.supabase_key }}
-        run: npm run render
-      
-      - name: Upload rendered video
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Parse manifest
+        id: manifest
+        run: |
+          echo '${{ github.event.inputs.manifest }}' > manifest.json
+          echo "video_id=$(jq -r '.videoId' manifest.json)" >> $GITHUB_OUTPUT
+          echo "title=$(jq -r '.title' manifest.json)" >> $GITHUB_OUTPUT
+
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Download voiceover
+        run: |
+          VOICEOVER_URL=$(jq -r '.voiceoverUrl' manifest.json)
+          curl -L "$VOICEOVER_URL" -o voiceover.mp3
+          ffprobe -v error -show_entries format=duration -of csv=p=0 voiceover.mp3 > duration.txt
+
+      - name: Download B-roll clips
+        run: |
+          mkdir -p broll
+          jq -c '.brollClips[]' manifest.json | while read clip; do
+            URL=$(echo $clip | jq -r '.url')
+            ID=$(echo $clip | jq -r '.source_id // empty' | tr -d '/')
+            if [ -n "$ID" ]; then
+              curl -L "$URL" -o "broll/${ID}.mp4" || true
+            fi
+          done
+
+      - name: Create video composition
+        run: |
+          DURATION=$(cat duration.txt)
+          
+          # Create concat file for b-roll
+          > concat.txt
+          for f in broll/*.mp4; do
+            if [ -f "$f" ]; then
+              echo "file '$f'" >> concat.txt
+            fi
+          done
+          
+          # Concatenate b-roll clips
+          if [ -s concat.txt ]; then
+            ffmpeg -f concat -safe 0 -i concat.txt -c copy broll_combined.mp4 || \
+            ffmpeg -f concat -safe 0 -i concat.txt -c:v libx264 -c:a aac broll_combined.mp4
+          else
+            # Create blank video if no b-roll
+            ffmpeg -f lavfi -i color=c=black:s=1920x1080:d=$DURATION -c:v libx264 broll_combined.mp4
+          fi
+          
+          # Loop b-roll to match voiceover duration
+          ffmpeg -stream_loop -1 -i broll_combined.mp4 -i voiceover.mp3 \
+            -map 0:v -map 1:a -c:v libx264 -c:a aac \
+            -shortest -y output.mp4
+
+      - name: Extract Shorts
+        run: |
+          mkdir -p shorts
+          jq -c '.shortsTimestamps[]' manifest.json | while read ts; do
+            START=$(echo $ts | jq -r '.start')
+            END=$(echo $ts | jq -r '.end')
+            TITLE=$(echo $ts | jq -r '.title' | tr ' ' '_')
+            DURATION=$((END - START))
+            
+            ffmpeg -i output.mp4 -ss $START -t $DURATION \
+              -vf "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2" \
+              -c:v libx264 -c:a aac -y "shorts/${TITLE}.mp4" || true
+          done
+
+      - name: Upload to Supabase Storage
+        id: upload
+        run: |
+          VIDEO_ID="${{ steps.manifest.outputs.video_id }}"
+          SUPABASE_URL="${{ github.event.inputs.supabase_url }}"
+          SUPABASE_KEY="${{ github.event.inputs.supabase_key }}"
+          
+          # Upload main video
+          VIDEO_PATH="${VIDEO_ID}/main.mp4"
+          curl -X POST "${SUPABASE_URL}/storage/v1/object/videos/${VIDEO_PATH}" \
+            -H "Authorization: Bearer ${SUPABASE_KEY}" \
+            -H "Content-Type: video/mp4" \
+            --data-binary @output.mp4
+          
+          VIDEO_URL="${SUPABASE_URL}/storage/v1/object/public/videos/${VIDEO_PATH}"
+          echo "video_url=${VIDEO_URL}" >> $GITHUB_OUTPUT
+          
+          # Upload shorts
+          SHORTS_URLS="[]"
+          for short in shorts/*.mp4; do
+            if [ -f "$short" ]; then
+              SHORT_NAME=$(basename "$short")
+              SHORT_PATH="${VIDEO_ID}/${SHORT_NAME}"
+              curl -X POST "${SUPABASE_URL}/storage/v1/object/videos/${SHORT_PATH}" \
+                -H "Authorization: Bearer ${SUPABASE_KEY}" \
+                -H "Content-Type: video/mp4" \
+                --data-binary @"$short"
+              SHORT_URL="${SUPABASE_URL}/storage/v1/object/public/videos/${SHORT_PATH}"
+              SHORTS_URLS=$(echo $SHORTS_URLS | jq --arg url "$SHORT_URL" '. + [$url]')
+            fi
+          done
+          echo "shorts_urls=${SHORTS_URLS}" >> $GITHUB_OUTPUT
+
+      - name: Callback to Supabase
         if: always()
-        uses: actions/upload-artifact@v3
-        with:
-          name: rendered-video-${{ github.event.inputs.job_id }}
-          path: output/
-          retention-days: 30
+        run: |
+          SUPABASE_URL="${{ github.event.inputs.supabase_url }}"
+          JOB_ID="${{ github.event.inputs.job_id }}"
+          VIDEO_ID="${{ steps.manifest.outputs.video_id }}"
+          
+          if [ "${{ job.status }}" == "success" ]; then
+            curl -X POST "${SUPABASE_URL}/functions/v1/render-callback" \
+              -H "Content-Type: application/json" \
+              -d '{
+                "jobId": "'"${JOB_ID}"'",
+                "videoId": "'"${VIDEO_ID}"'",
+                "success": true,
+                "videoUrl": "${{ steps.upload.outputs.video_url }}",
+                "shortsUrls": ${{ steps.upload.outputs.shorts_urls }},
+                "githubRunId": "${{ github.run_id }}"
+              }'
+          else
+            curl -X POST "${SUPABASE_URL}/functions/v1/render-callback" \
+              -H "Content-Type: application/json" \
+              -d '{
+                "jobId": "'"${JOB_ID}"'",
+                "videoId": "'"${VIDEO_ID}"'",
+                "success": false,
+                "error": "GitHub Actions render failed",
+                "githubRunId": "${{ github.run_id }}"
+              }'
+          fi
